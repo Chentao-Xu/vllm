@@ -167,56 +167,57 @@ class Mxfp8LinearOp:
         out_dtype: torch.dtype,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        N, K = weight.shape
-
+        N_padded, K_padded = weight.shape
         input_shape = input.shape
-        input_2d = input.view(-1, K)
+        # 获取真实的 K
+        K_orig = input_shape[-1]
+        input_2d = input.view(-1, K_orig)
         M_orig = input_2d.shape[0]
-
-        # Minimum dimension size for F8_128x4 block scaling layout
+        
         min_dim = 128
 
-        assert min_dim <= K, (
-            f"mm_mxfp8 requires K >= {min_dim}, got K={K}. "
-            f"in_features is too small for mm_mxfp8."
-        )
-        assert K % MXFP8_BLOCK_SIZE == 0, (
-            f"mm_mxfp8 requires K to be divisible by {MXFP8_BLOCK_SIZE}, got K={K}."
-        )
-        assert min_dim <= N, (
-            f"mm_mxfp8 requires N >= {min_dim}, got N={N}. "
-            f"out_features is too small for mm_mxfp8."
-        )
-
+        # 计算 M 的 Padding
         M_padded = ((M_orig + min_dim - 1) // min_dim) * min_dim
-        if M_padded != M_orig:
-            pad_rows = M_padded - M_orig
-            input_2d = torch.nn.functional.pad(input_2d, (0, 0, 0, pad_rows))
+        pad_rows = M_padded - M_orig
+        
+        # 计算 K 的 Padding（要和权重的 K_padded 对齐）
+        pad_cols = K_padded - K_orig
 
+        # 对输入进行 Padding
+        if pad_rows > 0 or pad_cols > 0:
+            input_2d = torch.nn.functional.pad(input_2d, (0, pad_cols, 0, pad_rows))
+
+        # 动态量化输入 (⚠️ 设为 False)
         input_mxfp8, input_scale = mxfp8_e4m3_quantize(
             input_2d,
-            is_sf_swizzled_layout=True,  # Swizzled for best accuracy
+            is_sf_swizzled_layout=True, 
         )
-
         if not weight.is_contiguous():
             weight = weight.contiguous()
-
-        output = vllm_flashinfer.mm_mxfp8(
+        scale_a_2d = input_scale.view(M_padded, K_padded // 32).view(torch.float8_e8m0fnu)
+        scale_b_2d = weight_scale.view(N_padded, K_padded // 32).view(torch.float8_e8m0fnu)
+        # 调用 PyTorch 原生算子
+        output = torch._scaled_mm(
             input_mxfp8,
             weight.t(),
-            input_scale,
-            weight_scale,
-            out_dtype=out_dtype,
-            backend="cutlass",
+            scale_a_2d,
+            scale_b_2d,
+            bias=None,
+            out_dtype=torch.bfloat16,
         )
-
-        if M_padded != M_orig:
+        # 截断多余的 M 维度
+        if pad_rows > 0:
             output = output[:M_orig, :]
-
+            
+        # 截断多余的 N 维度 (可以通过 bias 的长度获取真实的 N，或者传 layer.orig_N 进来)
+        orig_N = bias.shape[0] if bias is not None else (N_padded - (min_dim - (N_padded % min_dim)) % min_dim) # 这里用偏置长度做 fallback 最安全
         if bias is not None:
-            output = output + bias
+            output = output[:, :orig_N] + bias
+        else:
+            # 如果碰巧遇到没有 bias 的层，通常它本身的 N 已经是标准大小，但也做一个安全切片
+            output = output[:, :orig_N] if orig_N != N_padded else output
 
-        output_shape = (*input_shape[:-1], N)
+        output_shape = (*input_shape[:-1], -1)
         return output.view(output_shape)
 
     def apply(
