@@ -28,6 +28,11 @@ from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    pad_nvfp4_input_for_torchao,
+    pad_nvfp4_weight_for_torchao,
+    slice_nvfp4_torchao_output,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped)
 from vllm.model_executor.parameter import (BlockQuantScaleParameter,
@@ -207,22 +212,92 @@ class Nvfp4LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_quant", weight)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        tp_world_size = 1
+        try:
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_world_size,
+            )
+            tp_world_size = max(1, int(get_tensor_model_parallel_world_size()))
+        except Exception:
+            tp_world_size = 1
+
+        alignment = self.group_size * tp_world_size
+        padded_weight, orig_n, orig_k, pad_n, pad_k = pad_nvfp4_weight_for_torchao(
+            layer.weight.data, alignment=alignment
+        )
+        expected_n = orig_n + pad_n
+        expected_k = orig_k + pad_k
+        if pad_n > 0 or pad_k > 0:
+            layer.weight.data = padded_weight
+
+        layer.orig_N = orig_n
+        layer.orig_K = orig_k
+        layer.pad_N = pad_n
+        layer.pad_K = pad_k
+        layer.nvfp4_expected_n = expected_n
+        layer.nvfp4_expected_k = expected_k
+
         config = NVFP4DynamicActivationNVFP4WeightConfig()
         _nvfp4_inference_linear_transform(layer, config)
+        if pad_n > 0 or pad_k > 0:
+            layer.weight_quant_torchao = layer.weight_quant.detach().clone()
+        else:
+            layer.weight_quant_torchao = layer.weight_quant.data
 
     def apply(self,
             layer: torch.nn.Module,
             x: torch.Tensor,
             bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        
-       # --- 1. CPU 预处理：reshape ---
-        # cpu_start = time.perf_counter()
+
         input_orig_shape = x.shape
         input_hp_r = x.reshape(-1, input_orig_shape[-1])
-        # cpu_preprocess_time = (time.perf_counter() - cpu_start) * 1000  # ms
+
+        weight_quant = getattr(layer, "weight_quant_torchao", layer.weight_quant.data)
+        weight_k = int(weight_quant.shape[1])
+        weight_k_aligned = ((weight_k + self.group_size - 1) // self.group_size) * self.group_size
+
+        meta_expected_k = getattr(layer, "nvfp4_expected_k", None)
+        if meta_expected_k is None:
+            orig_k = getattr(layer, "orig_K", None)
+            pad_k = getattr(layer, "pad_K", None)
+            if orig_k is not None and pad_k is not None:
+                meta_expected_k = orig_k + pad_k
+
+        expected_k = weight_k_aligned
+        if meta_expected_k is not None:
+            meta_expected_k = int(meta_expected_k)
+            if meta_expected_k == weight_k_aligned:
+                expected_k = meta_expected_k
+            elif meta_expected_k > weight_k_aligned and meta_expected_k % weight_k_aligned == 0:
+                expected_k = weight_k_aligned
+            else:
+                expected_k = meta_expected_k
+
+        if expected_k % self.group_size != 0:
+            raise RuntimeError(
+                f"NVFP4 expected_k={expected_k} for layer "
+                f"{getattr(layer, 'prefix', layer.__class__.__name__)} is not divisible by "
+                f"{self.group_size}"
+            )
+
+        input_hp_r = pad_nvfp4_input_for_torchao(input_hp_r, expected_k)
+        if input_hp_r.shape[-1] != expected_k:
+            raise RuntimeError(
+                f"NVFP4 input padding failed for layer "
+                f"{getattr(layer, 'prefix', layer.__class__.__name__)}: got "
+                f"{input_hp_r.shape[-1]}, expected {expected_k}"
+            )
+        output = torch.nn.functional.linear(input_hp_r, weight_quant, None)
+        orig_n = getattr(layer, "orig_N", output.shape[-1])
+        output = slice_nvfp4_torchao_output(output, orig_n)
+
         if bias is not None:
-            output = torch.addmm(bias, input_hp_r, layer.weight_quant.data.t())
-        else:
-            output = torch.mm(input_hp_r, layer.weight_quant.data.t())
+            if bias.shape[0] != output.shape[-1]:
+                raise RuntimeError(
+                    f"Bias shape {tuple(bias.shape)} does not match NVFP4 output "
+                    f"shape {tuple(output.shape)} after slicing"
+                )
+            output = output + bias
+
         output = output.reshape(*input_orig_shape[:-1], output.shape[-1])
         return output

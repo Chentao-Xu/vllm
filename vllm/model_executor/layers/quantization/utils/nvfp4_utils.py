@@ -374,3 +374,50 @@ def slice_nvfp4_output(
     if out.shape[-1] != output_size:
         return out[..., :output_size].contiguous()
     return out
+
+def pad_nvfp4_weight_for_torchao(
+    weight: torch.Tensor,
+    alignment: int = 16,
+) -> tuple[torch.Tensor, int, int, int, int]:
+    """Pad dense BF16/FP16 weight for torchao NVFP4 path."""
+    if weight.ndim != 2:
+        raise ValueError(
+            f"Expected 2D weight for NVFP4 torchao path, got shape {tuple(weight.shape)}"
+        )
+
+    orig_n, orig_k = weight.shape
+    pad_n = (-orig_n) % alignment
+    pad_k = (-orig_k) % alignment
+    if pad_n > 0 or pad_k > 0:
+        weight = torch.nn.functional.pad(weight, (0, pad_k, 0, pad_n)).contiguous()
+    return weight, orig_n, orig_k, pad_n, pad_k
+
+
+def pad_nvfp4_input_for_torchao(
+    x2d: torch.Tensor,
+    expected_k: int,
+) -> torch.Tensor:
+    """Pad input K-dimension to expected torchao NVFP4 K size."""
+    input_k = x2d.shape[-1]
+    if input_k == expected_k:
+        return x2d
+    if input_k < expected_k:
+        return torch.nn.functional.pad(x2d, (0, expected_k - input_k))
+
+    raise RuntimeError(
+        f"Input hidden size {input_k} exceeds expected {expected_k} for NVFP4 matmul"
+    )
+
+
+def slice_nvfp4_torchao_output(
+    out2d: torch.Tensor,
+    orig_n: int,
+) -> torch.Tensor:
+    """Slice torchao NVFP4 output back to original output size."""
+    if out2d.shape[-1] < orig_n:
+        raise RuntimeError(
+            f"Output hidden size {out2d.shape[-1]} is smaller than original {orig_n}"
+        )
+    if out2d.shape[-1] == orig_n:
+        return out2d
+    return out2d[:, :orig_n].contiguous()
