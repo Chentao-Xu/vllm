@@ -31,6 +31,7 @@ QuantizationMethods = Literal[
     "torchao",
     "inc",
     "mxfp4",
+    "qutlass_online_mxfp4",
     "petit_nvfp4",
     "cpu_awq",
     "mxfp8",
@@ -131,6 +132,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     )
     from .moe_wna16 import MoeWNA16Config
     from .mxfp4 import Mxfp4Config
+    from .qutlass_online_mxfp4 import QutlassOnlineMxfp4Config
     from .petit import PetitNvFp4Config
     from .ptpc_fp8 import PTPCFp8Config
     from .torchao import TorchAOConfig
@@ -160,6 +162,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "auto-round": INCConfig,
         "inc": INCConfig,
         "mxfp4": Mxfp4Config,
+        "qutlass_online_mxfp4": QutlassOnlineMxfp4Config,
         "petit_nvfp4": PetitNvFp4Config,
         "cpu_awq": CPUAWQConfig,
         "mxfp8": Mxfp8Config,
